@@ -93,6 +93,10 @@ def render_expression_mesh(actor_id, sequence_id, frame_id, v2=False):
 
     frame_id = int(frame_id)
     output_frame_id = frame_id  # expression.obj stays under the raw frame's folder
+    # A v2 fit has fewer rows than raw frames (e.g. 125 rows for n_timesteps=373). Detect it here so
+    # callers that don't pass v2 (run_pipeline_all.py's process_frame) don't index it by raw frame.
+    if not v2 and data['expr'].shape[0] < num_frames:
+        v2 = True
     if v2:
         frame_id = v2_fit_index(frame_id, data['expr'].shape[0])  # fit row from here on
     flameBS.eye_pose_params = torch.as_tensor(
