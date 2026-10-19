@@ -29,7 +29,7 @@ from pathlib import Path
 from run_wrap_script_wrapping_test import wrap_mesh
 from skin_landmarks import assign_global_indices, NUM_STANDARD_LANDMARKS
 from propagated_landmarks import load_camera_standard_points, load_camera_skin_points
-from scan_face_masking import load_actor_neutral_dropped_indices
+from scan_face_masking import expression_mask_dir, load_actor_neutral_dropped_indices, load_expression_dropped_indices
 
 DEFAULT_CAMERAS_PATH = str(nersemble_paths.FACEVIEW_ROOT / "default_cameras.json")
 OUTPUT_ROOT = nersemble_paths.OUTPUT_ROOT
@@ -66,6 +66,12 @@ def actor_face_mask_path(actor: str, neutral_sequence_id: str) -> str:
     """Base path of the actor's own face mask, written by
     run_neutral_cotracker_propagation.ensure_actor_mask()."""
     return str(OUTPUT_ROOT / actor / neutral_sequence_id / "face_list.txt")
+
+
+def expression_face_mask_path(actor: str, sequence: str) -> str:
+    """Base path of a non-neutral sequence's own face mask, written by
+    run_neutral_cotracker_propagation.ensure_expression_mask()."""
+    return str(expression_mask_dir(actor, sequence) / "face_list.txt")
 
 
 def face_mask_files_exist(face_mask_path: str) -> bool:
@@ -246,6 +252,20 @@ def run_pipeline(intrinsic, points_list, triangulation_extrinsics, source_mesh_p
         if _pot_entry_vertex_index(int(pot_data[i][0]), pot_data[i][1], pot_data[i][2], topology_mesh.faces)
         not in mask_vertex_indices
     ]
+    # Forehead slope filter: skin targets on a vertex of a face the filter removed from this mask
+    # (<mask>_forehead.json, written by run_neutral_cotracker_propagation.compute_actor_face_mask) are left out
+    # too. Masks made before the filter have no such file and are unaffected.
+    forehead_sidecar = face_mask_path + "_forehead.json"
+    if os.path.exists(forehead_sidecar):
+        import forehead_filter
+        with open(forehead_sidecar, "r") as f:
+            forehead_removed = json.load(f)["removed_faces"]
+        forehead_indices = sorted(set(forehead_filter.targets_on_removed(pot_data, topology_mesh.faces, forehead_removed))
+                                  - jaw_skin_global_indices - set(outside_mask_indices))
+        if forehead_indices:
+            print(f"NOTE: {len(forehead_indices)} skin correspondence point(s) on faces the forehead slope filter "
+                  f"removed ({forehead_sidecar}) -- excluded from the correspondence map: {forehead_indices}")
+            outside_mask_indices = sorted(set(outside_mask_indices) | set(forehead_indices))
     if outside_mask_indices:
         print(f"NOTE: {len(outside_mask_indices)} skin/ear correspondence point(s) fall outside the "
               f"neutral frame's face mask ({face_mask_path}_inverse.txt) -- excluded from the correspondence "
@@ -253,9 +273,9 @@ def run_pipeline(intrinsic, points_list, triangulation_extrinsics, source_mesh_p
 
     scan_dropped = sorted(i for i in (scan_dropped_indices or []) if i < len(formatted))
     if scan_dropped:
-        print(f"NOTE: {len(scan_dropped)} landmark(s) dropped by the neutral frame's SAM landmark filter "
-              f"(outside the face mask, or occluded in every front camera) -- excluded from the correspondence "
-              f"map: {scan_dropped}")
+        print(f"NOTE: {len(scan_dropped)} landmark(s) dropped by the SAM landmark filter (actor's or this "
+              f"sequence's, see process_frame) -- outside the SAM masks, or occluded in every filter camera -- "
+              f"excluded from the correspondence map: {scan_dropped}")
 
     correpsondence_path = os.path.join(output_dir, "keypoint_vertices.json")
     with open(correpsondence_path, 'w') as out:
@@ -511,12 +531,18 @@ def process_frame(
         print("Time Elapsed: ", times["source_mesh_time"], ". Running pipeline...")
 
         # Face mask: an explicit override (the static mask, for propagation's
-        # bootstrap/second neutral wraps), else the actor's own mask from
-        # run_neutral_cotracker_propagation.ensure_actor_mask().
+        # bootstrap/second neutral wraps and expression-mask wraps), else this
+        # sequence's own mask (run_neutral_cotracker_propagation.
+        # ensure_expression_mask(), non-neutral sequences) when it exists, else
+        # the actor's own mask from ensure_actor_mask().
+        use_expression_mask = False
         if face_mask_path is None:
             if neutral_sequence_id is None:
                 raise RuntimeError(f"no neutral frame for {actor}, so no actor face mask -- run propagation first")
-            face_mask_path = actor_face_mask_path(actor, neutral_sequence_id)
+            expression_mask = expression_face_mask_path(actor, sequence)
+            use_expression_mask = sequence != neutral_sequence_id and face_mask_files_exist(expression_mask)
+            face_mask_path = expression_mask if use_expression_mask else actor_face_mask_path(actor, neutral_sequence_id)
+        print(f"Face mask ({'expression' if use_expression_mask else 'actor / override'}): {face_mask_path}")
         if not face_mask_files_exist(face_mask_path):
             raise RuntimeError(f"no face mask at {face_mask_path}* -- run run_neutral_cotracker_propagation.py first")
 
@@ -530,10 +556,20 @@ def process_frame(
         source_mesh_2_path = current_frame_obj_path
         correspondence_2_path = os.path.join(os.getcwd(), "target_correspondence_without_mask.json")
 
-        # SAM landmark filter of the actor's neutral frame, applied to every frame
-        # like the neutral FLAME face mask above (written by
+        # SAM landmark filter, paired with the face mask above: the sequence's own
+        # (made with its expression mask) when that mask is used, else the actor's
+        # neutral frame's, applied to every frame (written by
         # run_neutral_cotracker_propagation.py, scan_face_masking.filter_frame_landmarks).
-        scan_dropped_indices, neutral_filter_path = load_actor_neutral_dropped_indices(settings.landmarks_root, actor)
+        scan_dropped_indices = None
+        if use_expression_mask:
+            scan_dropped_indices, expression_filter_path = load_expression_dropped_indices(actor, sequence)
+            if scan_dropped_indices is None:
+                print(f"NOTE: expression mask without its landmark filter ({expression_filter_path}) -- "
+                      "using the actor's neutral-frame filter")
+            else:
+                print(f"Landmark filter (expression): {expression_filter_path}")
+        if scan_dropped_indices is None:
+            scan_dropped_indices, neutral_filter_path = load_actor_neutral_dropped_indices(settings.landmarks_root, actor)
         if scan_dropped_indices is None:
             print(f"NOTE: no neutral-frame landmark filter at {neutral_filter_path} -- wrapping without it "
                   f"(run run_neutral_cotracker_propagation.py {actor} --mask-only)")

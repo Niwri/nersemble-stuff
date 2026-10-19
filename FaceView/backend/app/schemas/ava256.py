@@ -1,7 +1,7 @@
 """Ava-256 capture review schemas (see services/ava256_labels.py)."""
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -53,3 +53,36 @@ class Ava256DoneResponse(BaseModel):
     export_path: Optional[str]
     labels_path: str
     counts: Dict[str, int]
+
+
+# --- Neutral frame · ear tops (services/ava256_neutral.py) ---
+
+class Ava256NeutralCamera(BaseModel):
+    camera_id: str
+    side: Literal["left", "front", "right", "unknown"]
+    azimuth_deg: float  # < 0: the actor's left
+    elevation_deg: float  # > 0: above eye level
+    angle_deg: float  # from the face's forward direction
+
+
+class Ava256NeutralResponse(BaseModel):
+    capture_id: str
+    frame_id: str
+    coverage: int
+    needed_total: int
+    cameras: List[Ava256NeutralCamera]  # cameras behind the head left out; sorted left -> right
+    default_cameras: List[str]
+    ear_tops: List[int]  # saved ear-top indices (2 = left, 9 = right)
+
+
+class Ava256SaveEarPointRequest(BaseModel):
+    ear: Literal["left", "right"]
+    # camera_id -> normalized [0, 1] (x, y) click on that camera's neutral image
+    clicks: Dict[str, Tuple[float, float]] = Field(min_length=2)
+
+
+class Ava256SaveEarPointResponse(BaseModel):
+    status: Literal["ok"] = "ok"
+    world_xyz: List[float]
+    cameras_used: List[str]
+    reprojection_error_px: Dict[str, float]

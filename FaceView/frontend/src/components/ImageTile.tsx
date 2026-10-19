@@ -17,6 +17,8 @@ interface ImageTileProps {
   earAddMode?: boolean;
   pendingEarClick?: { x: number; y: number };
   onEarClick?: (x: number, y: number) => void;
+  // Shown on top of whitelist.json's set; defaults to FaceScape's.
+  extraVisibleIndices?: number[];
 }
 
 // Shown for FaceScape only, not Nersemble -- see LandmarkOverlay's
@@ -35,7 +37,8 @@ export function ImageTile({
   showSkinLandmarks,
   earAddMode,
   pendingEarClick,
-  onEarClick
+  onEarClick,
+  extraVisibleIndices = FACESCAPE_EXTRA_VISIBLE_INDICES
 }: ImageTileProps) {
   const [dimensions, setDimensions] = useState({ width: 320, height: 480 });
   const imgRef = useRef<HTMLImageElement | null>(null);
@@ -79,7 +82,7 @@ export function ImageTile({
         frame={frame}
         width={dimensions.width}
         height={dimensions.height}
-        extraVisibleIndices={FACESCAPE_EXTRA_VISIBLE_INDICES}
+        extraVisibleIndices={extraVisibleIndices}
         skinFrame={skinFrame}
         showSkinLandmarks={showSkinLandmarks}
         earAddMode={earAddMode}

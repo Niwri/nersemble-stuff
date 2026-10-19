@@ -81,6 +81,7 @@ import argparse
 import contextlib
 import fcntl
 import json
+import os
 import subprocess
 import sys
 import time
@@ -96,8 +97,7 @@ from sequence_blacklist import BLACKLISTED_SEQUENCES
 from skin_landmarks import SKIN_REGIONS, NUM_STANDARD_LANDMARKS, assign_global_indices, load_skin_regions
 import scan_face_masking
 
-ROOT = Path(__file__).resolve().parent
-FACEVIEW_ROOT = ROOT.parent / "FaceView"
+FACEVIEW_ROOT = nersemble_paths.FACEVIEW_ROOT
 
 # torchvision's own RAFT port (https://github.com/princeton-vl/raft), not a
 # clone of the original repo -- same architecture/weights lineage, but
@@ -1678,6 +1678,18 @@ def process_target_sequence(
             for t, per_camera in updates_by_frame.items():
                 for camera_id, updates in per_camera.items():
                     _write_region_frame(settings.landmarks_root, actor_id, target_sequence_id, camera_id, t, updates, file_prefix=file_prefix)
+        # This sequence's own face mask + landmark filter (needs the landmarks
+        # just written), rebuilt with them, before the pair can be wrapped. On
+        # failure its frames fall back to the actor's mask.
+        if not same_sequence:
+            try:
+                ok_mask = ensure_expression_mask(actor_id, neutral_sequence_id, neutral_frame_id, target_sequence_id,
+                                                 settings, default_cameras, model, args, force=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"FAIL {tag}: expression mask: {exc}")
+                ok_mask = False
+            if not ok_mask:
+                print(f"NOTE {tag}: no expression mask -- this sequence wraps with the actor's mask")
         confirm_labeled(settings.label_tracker_path, actor_id, target_sequence_id)
 
     total_skin = sum(len(v) for v in indices_by_region.values())
@@ -1806,7 +1818,24 @@ def compute_actor_face_mask(
     if masks is None:
         print(f"FAIL {tag}: face_ray_masking found no usable camera")
         return False
+    # Forehead slope filter (forehead_filter.py): forehead-band faces that bulge forward onto the hair on this
+    # wrap leave the mask. The removed faces go to <mask>_forehead.json, written BEFORE the mask files, from
+    # which run_pipeline_all.py drops the skin targets on their vertices.
+    import forehead_filter
+    not_hit, hit, wn_selection, wn_invisible = masks
+    forehead = forehead_filter.flag_faces(wrap_v, wrap_f, hit)
+    removed = set(forehead["removed"])
+    if removed:
+        masks = (sorted(set(not_hit) | removed), sorted(set(hit) - removed),
+                 sorted(set(wn_selection) | removed), sorted(set(wn_invisible) - removed))
+    print(f"{tag} {forehead_filter.summary(forehead, [])} (skin targets on them are dropped at wrap time)")
     Path(mask_path).parent.mkdir(parents=True, exist_ok=True)
+    sidecar = Path(str(mask_path) + forehead_filter.SIDECAR_SUFFIX)
+    tmp = sidecar.with_name(f"{sidecar.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({"removed_faces": forehead["removed"], "n_absolute": len(forehead["absolute"]),
+                               "n_bend": len(forehead["bend"]), "n_above": len(forehead["above"]),
+                               "params": forehead["params"], "wrap": str(wrapped_mesh_path)}))
+    os.replace(tmp, sidecar)
     frm.write_face_mask_files(str(mask_path), masks)
     return True
 
@@ -1893,6 +1922,145 @@ def ensure_actor_mask(
         if not compute_actor_face_mask(actor_id, neutral_sequence_id, neutral_frame_id, wrapped_mesh_path, mask_path, settings):
             return False
         print(f"DONE {tag}: actor face mask written to {mask_path}*")
+    return True
+
+
+_raft_for_expression_masks: RaftModel | None = None
+
+
+def closest_scan_frame_to_neutral(
+    actor_id: str, neutral_sequence_id: str, neutral_frame_id: int, sequence_id: str, settings,
+    default_cameras: list[str], model: RaftModel | None,
+) -> tuple[int | None, int]:
+    """(raw frame, number of candidates): the frame of `sequence_id` closest to
+    the actor's neutral frame, picked by _find_anchor_frame() -- the same RAFT
+    forward/backward test, camera (default_cameras[0]) and query points (the
+    neutral frame's standard landmarks) as process_target_sequence()'s global
+    anchor -- but only among frames that have a Meshroom scan and landmarks
+    (frames_with_scans_and_landmarks), since the expression mask needs a wrap
+    of that frame. (None, n) when no frame qualifies."""
+    global _raft_for_expression_masks
+    cam = default_cameras[0]
+    video = settings.processed_root / actor_id / sequence_id / f"cam_{cam}_delegation.mp4"
+    neutral_video = settings.processed_root / actor_id / neutral_sequence_id / f"cam_{cam}_delegation.mp4"
+    if not video.exists() or not neutral_video.exists():
+        return None, 0
+    total = probe_video_frame_count(video)
+    candidates = [raw for raw in scan_face_masking.frames_with_scans_and_landmarks(
+        settings.landmarks_root, actor_id, sequence_id, default_cameras) if raw // RAW_FRAME_STRIDE < total]
+    if len(candidates) <= 1:
+        return (candidates[0] if candidates else None), len(candidates)
+    raw_width, raw_height = probe_video_size(
+        settings.data_root / actor_id / "sequences" / neutral_sequence_id / "images" / f"cam_{cam}.mp4")
+    deleg_w, deleg_h = DELEGATION_SIZE
+    neutral_delegation_idx = neutral_frame_id // RAW_FRAME_STRIDE
+    seeds = load_ear_seeds(settings.landmarks_root, actor_id, neutral_sequence_id, neutral_delegation_idx, cam,
+                           set(range(NUM_STANDARD_LANDMARKS)), raw_width, raw_height)
+    if not seeds:
+        return None, len(candidates)
+    query = np.array([(np.clip(x * deleg_w / raw_width, 0, deleg_w - 1), np.clip(y * deleg_h / raw_height, 0, deleg_h - 1))
+                      for x, y in seeds.values()], dtype=np.float64)
+    if model is None:  # --mask-only runs don't load RAFT up front
+        if _raft_for_expression_masks is None:
+            _raft_for_expression_masks = load_model(False)
+        model = _raft_for_expression_masks
+    neutral_img = extract_delegation_frames(neutral_video, neutral_delegation_idx, neutral_delegation_idx + 1, deleg_w, deleg_h)
+    frames = extract_delegation_frames(video, 0, total, deleg_w, deleg_h)
+    clip = np.concatenate([neutral_img, frames[[raw // RAW_FRAME_STRIDE for raw in candidates]]], axis=0)
+    anchor_t, _ = _find_anchor_frame(model, clip, query)
+    return candidates[anchor_t - 1], len(candidates)
+
+
+def ensure_expression_mask(
+    actor_id: str, neutral_sequence_id: str, neutral_frame_id: int, sequence_id: str, settings,
+    default_cameras: list[str], model: RaftModel | None, args: argparse.Namespace, force: bool = False,
+) -> bool:
+    """The per-expression face mask + landmark filter of a NON-neutral sequence
+    (scan_face_masking.expression_mask_dir()), which run_pipeline_all.py uses for
+    that sequence's frames instead of the actor's -- the actor mask comes from
+    the neutral frame, so an ear visible there but under hair in this sequence
+    (another hairstyle) would otherwise be wrapped onto the hair. Built like the
+    actor mask, at this sequence's frame closest to the neutral
+    (closest_scan_frame_to_neutral):
+      1. wrap that frame with the static mask, into expression_mask/work/ (its
+         own OUTPUT_ROOT, the neutral frame's folder linked in as the source
+         mesh) -- the sequence's real frame folders are not touched;
+      2. landmark filter (filter_frame_landmarks, dry run) at that frame, skin
+         points from that wrap -> landmark_filter.json;
+      3. face mask (compute_actor_face_mask) on that wrap -> face_list.txt*,
+         written last: run_pipeline_all.py switches to the expression mask once
+         its files exist.
+    No-op (True) for the neutral sequence and when both already exist unless
+    `force`. Returns whether they exist afterwards (unless --dry-run). Callers
+    hold the sequence's _sequence_pair_lock."""
+    if sequence_id == neutral_sequence_id:
+        return True
+    tag = f"[actor={actor_id} sequence={sequence_id}]"
+    out_dir = scan_face_masking.expression_mask_dir(actor_id, sequence_id)
+    mask_path = out_dir / "face_list.txt"
+    filter_path = out_dir / scan_face_masking.EXPRESSION_FILTER_NAME
+
+    def done() -> bool:
+        return filter_path.exists() and all((out_dir / ("face_list.txt" + s)).exists() for s in FACE_MASK_SUFFIXES)
+
+    if done() and not force:
+        return True
+    raw_frame, n_candidates = closest_scan_frame_to_neutral(
+        actor_id, neutral_sequence_id, neutral_frame_id, sequence_id, settings, default_cameras, model)
+    if raw_frame is None:
+        print(f"NOTE {tag}: no frame with a Meshroom scan and landmarks -- no expression mask, "
+              "its frames use the actor's mask")
+        return False
+    print(f"{tag} expression mask: closest frame to the neutral among {n_candidates} scanned frame(s) is {raw_frame}")
+    if args.dry_run:
+        print(f"[dry-run] {tag}: would wrap frame {raw_frame} with the static mask and build its mask + landmark filter")
+        return done()
+
+    # 1) Static-mask wrap of that frame, in its own OUTPUT_ROOT.
+    work_root = out_dir / "work"
+    neutral_dir = OUTPUT_ROOT / actor_id / neutral_sequence_id / str(neutral_frame_id)
+    neutral_link = work_root / actor_id / neutral_sequence_id / str(neutral_frame_id)
+    if not neutral_link.exists():
+        neutral_link.parent.mkdir(parents=True, exist_ok=True)
+        neutral_link.symlink_to(neutral_dir, target_is_directory=True)
+    wrapped = work_root / actor_id / sequence_id / str(raw_frame) / "wrapped_mesh.obj"
+    wrapped.unlink(missing_ok=True)  # never reuse a wrap of another (or an older) frame choice
+    cmd = [sys.executable, str(args.pipeline_script), actor_id, sequence_id, str(raw_frame), str(args.resolution),
+           "--face-mask-path", str(STATIC_FACE_MASK_PATH)]
+    print(f"{tag} expression mask 1/3: static-mask wrap of frame {raw_frame} into {work_root}")
+    returncode = subprocess.run(cmd, env=dict(os.environ, OUTPUT_ROOT=str(work_root))).returncode
+    if returncode != 0 or not wrapped.exists():
+        print(f"FAIL {tag}: expression-mask wrap of frame {raw_frame} (exit_code={returncode})")
+        return False
+    (wrapped.parent / "mesh.obj").unlink(missing_ok=True)  # the unzipped scan, ~13 MB
+
+    # 2) Landmark filter at that frame (dry run: writes nothing under landmarks/ or the frame's output folder).
+    from gpu_utils import wait_for_gpu_memory as reserve_gpu_memory
+    import face_ray_masking_wrapping_test as frm
+
+    print(f"{tag} expression mask 2/3: landmark filter at frame {raw_frame}")
+    with reserve_gpu_memory(FACE_RAY_MASKING_REQUIRED_MB, label="expression landmark filter (SAM)"):
+        payload = scan_face_masking.filter_frame_landmarks(
+            actor_id, sequence_id, raw_frame, default_cameras, len(assign_global_indices()), settings,
+            dry_run=True, skin_xyz_override=load_skin_world_xyz(wrapped)[0])
+        frm.release_segmenters()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    tmp = filter_path.with_name(f"{filter_path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload))
+    os.replace(tmp, filter_path)
+
+    # 3) Face mask on that wrap.
+    print(f"{tag} expression mask 3/3: face_ray_masking on {wrapped}")
+    if not compute_actor_face_mask(actor_id, sequence_id, raw_frame, wrapped, mask_path, settings):
+        return False
+    (out_dir / scan_face_masking.EXPRESSION_INFO_NAME).write_text(json.dumps({
+        "raw_frame": raw_frame, "candidates": n_candidates, "neutral": [neutral_sequence_id, neutral_frame_id],
+        "wrap": str(wrapped), "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }, indent=1))
+    dropped = sorted(int(i) for i in payload["dropped"])
+    print(f"DONE {tag}: expression mask + landmark filter from frame {raw_frame} in {out_dir} "
+          f"(filter drops {len(dropped)}: {dropped})")
     return True
 
 
@@ -2038,6 +2206,19 @@ def run_mask_only(actor_id: str, sequence_id: str, settings, default_cameras: li
                     return False
 
     ok = ensure_neutral_landmark_filter(actor_id, settings, default_cameras, args, force=True)
+
+    # A non-neutral sequence's own face mask + landmark filter (built if missing;
+    # --force-expression-mask rebuilds it) -- e.g. to backfill sequences
+    # propagated before per-expression masks existed.
+    neutral_sequence_id, neutral_frame_id = load_actor_neutral_frame(settings.landmarks_root, actor_id)
+    if sequence_id != neutral_sequence_id:
+        with _sequence_pair_lock(settings.landmarks_root, actor_id, sequence_id) as acquired:
+            if not acquired:
+                print(f"SKIP {tag}: sequence is locked by another run already processing it")
+                return False
+            ok = ensure_expression_mask(actor_id, neutral_sequence_id, neutral_frame_id, sequence_id, settings,
+                                        default_cameras, None, args,
+                                        force=getattr(args, "force_expression_mask", False)) and ok
 
     if args.frame is None and not getattr(args, "all_frames", False):
         return ok
@@ -2364,8 +2545,9 @@ def main() -> int:
             "No propagation, no label change, once per actor: make sure the actor's FLAME neutral-frame face "
             "mask exists (built if missing, see ensure_actor_mask; --force-mask recomputes it), then recompute "
             "the neutral frame's scan mask + filtered landmark JSON -- the landmark indices run_pipeline_all.py "
-            "drops from every frame of the actor. Needs actor_id (sequence_id is ignored unless --all-frames / "
-            "--frame is given)."
+            "drops from every frame of the actor. Needs actor_id. With a non-neutral sequence_id, also builds "
+            "that sequence's own expression mask + landmark filter if missing (see ensure_expression_mask; "
+            "--force-expression-mask rebuilds it)."
         ),
     )
     parser.add_argument("--frame", type=int, default=None,
@@ -2375,9 +2557,12 @@ def main() -> int:
                              "Meshroom scan (inspection only -- wraps use the neutral frame's; ~40 s per frame)")
     parser.add_argument("--force-mask", action="store_true",
                         help="--mask-only: recompute the actor's FLAME neutral-frame face mask even if it exists")
+    parser.add_argument("--force-expression-mask", action="store_true",
+                        help="--mask-only with a non-neutral sequence_id: rebuild that sequence's expression mask + "
+                             "landmark filter even if they exist")
     args = parser.parse_args()
-    if (args.frame is not None or args.force_mask or args.all_frames) and not args.mask_only:
-        parser.error("--frame / --all-frames / --force-mask only apply with --mask-only")
+    if (args.frame is not None or args.force_mask or args.force_expression_mask or args.all_frames) and not args.mask_only:
+        parser.error("--frame / --all-frames / --force-mask / --force-expression-mask only apply with --mask-only")
     if args.mask_only and not args.actor_id:
         parser.error("--mask-only needs actor_id")
     if (args.frame is not None or args.all_frames) and not args.sequence_id:

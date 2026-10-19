@@ -4,8 +4,9 @@ Nersemble's counterpart to wrap_script_ava256/face_ray_masking_ava256_mesh.py
 (scan mask) + run_pipeline._filter_by_scan_mask (landmark filter).
 
 Scan mask (compute_scan_face_mask):
-  - SAM, per FRONT camera (face_ray_masking_wrapping_test.NERSEMBLE_FRONT_CAMERAS
-    that have a video), on the frame's raw image at half resolution, with the
+  - SAM, per FILTER camera (face_ray_masking_wrapping_test.NERSEMBLE_FRONT_CAMERAS
+    plus FILTER_SIDE_CAMERAS, the two cameras facing the ears, that have a
+    video), on the frame's raw image at half resolution, with the
     frame's triangulated SAM_PROMPT_INDICES landmarks (nosebridge, eyebrow
     ends, lip corners, ears -- whichever were triangulated) reprojected into
     that camera as positive point prompts -- same as Ava-256. Largest connected component
@@ -29,12 +30,12 @@ Landmark filter (filter_frame_landmarks): every landmark of the frame --
 the 74 standard ones AND the skin ones -- is triangulated exactly as
 run_pipeline_all.process_frame() does (same default cameras, same
 propagated/sapiens2 merge, same triangulate()), then checked in 2D against the
-same front cameras' SAM masks (landmark_sam_votes):
+same filter cameras' SAM masks (landmark_sam_votes):
   - a camera only votes when the landmark is on-image and NOT occluded: the
     scan's own depth at the landmark's pixel (depth-tested raster) must not be
     more than OCCLUSION_TOLERANCE_M in front of the landmark;
   - it votes "inside" when the landmark is inside the SAM mask or within
-    MASK_MARGIN_PX of it (points on / near the mask boundary count as inside);
+    MASK_MARGIN_PX of it (0: only points on the mask itself count as inside);
   - kept when inside for a strict majority (> AGREEMENT_FRACTION) of the
     voting cameras, or for at least MIN_AGREEING_CAMERAS of them; a landmark
     that is occluded (or off-image) in every camera is dropped -- e.g. ear
@@ -47,6 +48,12 @@ run_pipeline_all.process_frame() drops load_actor_neutral_dropped_indices()
 from every frame's correspondence map (landmark indices are the same in every
 frame). Per-frame filtered JSONs (--mask-only --all-frames / --frame) are for
 inspection only.
+Per-expression masks: every other sequence of the actor can have its own FLAME
+face mask + landmark filter, computed at that sequence's frame closest to the
+neutral (run_neutral_cotracker_propagation.ensure_expression_mask), stored in
+expression_mask_dir(); run_pipeline_all.process_frame() uses them for that
+sequence instead of the actor's when they exist (hairstyles change between
+sequences, so an ear visible on the neutral frame can be under hair elsewhere).
 The scan mask above is still computed and written, but no longer decides
 which landmarks are kept (a single nearest scan face at the cheek/jaw
 silhouette is seen by only 0-3 cameras and got eroded, dropping points that
@@ -91,9 +98,20 @@ MIN_AGREEING_CAMERAS = 3
 MASK_EROSION_ITERATIONS = 1
 NUM_STANDARD_LANDMARKS = 74
 # 2D landmark test: a landmark within this many full-resolution pixels of a
-# camera's SAM mask counts as inside it (~4.5 mm on the face at Nersemble's
-# ~8190 px focal length / ~1.2 m) -- boundary points are kept.
-MASK_MARGIN_PX = 30
+# camera's SAM mask counts as inside it. Was 30 (~4.5 mm on the face), which
+# let ear points on hair just beside the face pass; 0 = on the mask itself.
+MASK_MARGIN_PX = 0
+# Cameras facing the left / right ear, added to the front cameras for the SAM
+# masks of the scan mask and the landmark filter, so ear points get a vote from
+# a camera that actually sees the ear.
+FILTER_SIDE_CAMERAS = ("222200044", "221501007")
+# Per-expression mask + landmark filter of a non-neutral sequence
+# (expression_mask_dir()): FLAME mask files face_list.txt + FACE_MASK_SUFFIXES,
+# EXPRESSION_FILTER_NAME (filter_frame_landmarks payload) and
+# EXPRESSION_INFO_NAME (which frame they were made from).
+EXPRESSION_MASK_DIR_NAME = "expression_mask"
+EXPRESSION_FILTER_NAME = "landmark_filter.json"
+EXPRESSION_INFO_NAME = "info.json"
 # A camera sees a landmark unless the scan surface at its pixel is more than
 # this far in front of it (landmarks sit ~1-7 mm off the scan).
 OCCLUSION_TOLERANCE_M = 0.01
@@ -137,6 +155,22 @@ def load_scan_dropped_indices(landmarks_root: Path, actor_id: str, sequence_id: 
         return None
     with open(path, "r", encoding="utf-8") as f:
         return sorted(int(i) for i in json.load(f)["dropped"])
+
+
+def expression_mask_dir(actor_id: str, sequence_id: str) -> Path:
+    """OUTPUT_ROOT/<actor>/<sequence>/expression_mask -- the sequence's own FLAME
+    face mask (face_list.txt*) and landmark filter, see ensure_expression_mask."""
+    return OUTPUT_ROOT / actor_id / sequence_id / EXPRESSION_MASK_DIR_NAME
+
+
+def load_expression_dropped_indices(actor_id: str, sequence_id: str) -> tuple[list[int] | None, Path]:
+    """(dropped indices, path) of the sequence's own landmark filter; indices are
+    None when the sequence has none (its frames then use the actor's)."""
+    path = expression_mask_dir(actor_id, sequence_id) / EXPRESSION_FILTER_NAME
+    if not path.exists():
+        return None, path
+    with open(path, "r", encoding="utf-8") as f:
+        return sorted(int(i) for i in json.load(f)["dropped"]), path
 
 
 def load_actor_neutral_dropped_indices(landmarks_root: Path, actor_id: str) -> tuple[list[int] | None, Path]:
@@ -441,20 +475,20 @@ def compute_scan_face_mask(actor_id: str, sequence_id: str, raw_frame: int, vert
                            prompt_xyz: np.ndarray, settings, *, sam_masks_out: dict | None = None,
                            weights_out: dict | None = None, dry_run: bool = False,
                            prompt_indices: list[int] | None = None) -> list[int]:
-    """Included scan face indices (SAM on the front cameras + vote), written to
-    scan_mask_path() unless dry_run."""
+    """Included scan face indices (SAM on the front + FILTER_SIDE_CAMERAS cameras
+    + vote), written to scan_mask_path() unless dry_run."""
     import face_ray_masking_wrapping_test as frm
 
     with open(Path(settings.data_root) / actor_id / "calibration" / "camera_params.json", "r") as f:
         cam_data = json.load(f)
     K = np.asarray(cam_data["intrinsics"], dtype=np.float64)
     world_2_cam = {c: np.asarray(m, dtype=np.float64) for c, m in cam_data["world_2_cam"].items()}
-    front = [c for c in sorted(frm.NERSEMBLE_FRONT_CAMERAS) if c in world_2_cam]
-    images = load_camera_images(actor_id, sequence_id, raw_frame, front, settings)
+    cams = [c for c in sorted(set(frm.NERSEMBLE_FRONT_CAMERAS) | set(FILTER_SIDE_CAMERAS)) if c in world_2_cam]
+    images = load_camera_images(actor_id, sequence_id, raw_frame, cams, settings)
     # Eyebrow / ear prompts occlusion-tested against this scan (hair included).
     masks = compute_sam_masks(images, K, world_2_cam, prompt_xyz, prompt_indices, (verts, faces))
     if not masks:
-        raise RuntimeError(f"no front camera usable for the scan mask of {actor_id}/{sequence_id}/{raw_frame}")
+        raise RuntimeError(f"no filter camera usable for the scan mask of {actor_id}/{sequence_id}/{raw_frame}")
     if sam_masks_out is not None:
         sam_masks_out.update(masks)
     included = vote_faces(verts, faces, masks, K, world_2_cam, weights_out=weights_out)

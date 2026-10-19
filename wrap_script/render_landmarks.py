@@ -11,7 +11,15 @@ Run from this directory (wrap_script/), same convention as render_mesh_compare.p
 """
 from __future__ import annotations
 
-import nersemble_paths
+import sys
+from pathlib import Path
+
+# Also loaded by file path from wrap_script_facescape/ (render_point_overlay_frame.py,
+# render_landmarks_facescape.py), where this folder isn't on sys.path: make nersemble_paths,
+# which sits next to this file, importable either way.
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+import nersemble_paths  # noqa: E402
 import argparse
 import json
 import shutil

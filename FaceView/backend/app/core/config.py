@@ -167,6 +167,21 @@ class Settings(BaseSettings):
         
         description="Where the Ava-256 tab's Done button archives a capture's finished <capture>.csv.",
     )
+    ava256_data_root: Path = Field(
+        description=(
+            "Raw Ava-256 captures: <capture>/decoder/{camera_calibration.json, frame_list.csv, keypoints_3d/, "
+            "image/cam<id>.zip} (read by services/ava256_neutral.py for the ear-top tab)."
+        ),
+    )
+    ava256_landmark_root: Path = Field(
+        description=(
+            "wrap_script_ava256's landmarks_ava-256/: <capture>/neutral_frame.json, the per-frame "
+            "<group>_<frame>.json world points, and the ear-top tab's ear_tops.json."
+        ),
+    )
+    ava256_neutral_images_root: Path = Field(
+        description="PNG cache of each capture's neutral-frame camera images: <capture>/<frame>/<camera>.png.",
+    )
 
     wrap_script_root: Path = Field(
         description="Nersemble wrap_script/ (services/facescape_ear_points.py imports its modules from here)."

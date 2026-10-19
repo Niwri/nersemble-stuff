@@ -4,6 +4,7 @@ import classNames from "classnames";
 import { api } from "@/lib/api";
 import { AVA256_FRAME_LABELS, type Ava256FrameLabel, type Ava256FrameStatus, type Ava256RangesByLabel } from "@/lib/types";
 import { useAva256Store } from "@/state/useAva256Store";
+import { Ava256EarTops } from "./Ava256EarTops";
 
 // Frame positions are 1-based and match the "#N" burned into each video frame
 // by render_capture_line_video.py and the rows of the capture's CSV.
@@ -63,7 +64,36 @@ function rangesFromStatuses(statuses: Ava256FrameStatus[]): RangeText {
   return { Valid: formatRanges(out.Valid), Invalid: formatRanges(out.Invalid), Rerun: formatRanges(out.Rerun) };
 }
 
+type Ava256Tab = "lineRender" | "earTops";
+
+// Two views of the selected capture: the line-render video labeller below, and
+// the neutral frame's multiview grid for adding the ear tops (Ava256EarTops).
 export function Ava256Player() {
+  const selectedCapture = useAva256Store((state) => state.selectedCapture);
+  const [activeTab, setActiveTab] = useState<Ava256Tab>("lineRender");
+  if (!selectedCapture) {
+    return <div className="text-slate-400">Select an Ava-256 capture on the left.</div>;
+  }
+  const tabClass = (tab: Ava256Tab) =>
+    `px-3 py-1.5 text-xs font-medium ${
+      activeTab === tab ? "border-b-2 border-sky-400 text-white" : "text-slate-400 hover:text-slate-200"
+    }`;
+  return (
+    <div className="space-y-4">
+      <div className="flex gap-1 border-b border-slate-800">
+        <button className={tabClass("lineRender")} onClick={() => setActiveTab("lineRender")}>
+          Line render
+        </button>
+        <button className={tabClass("earTops")} onClick={() => setActiveTab("earTops")}>
+          Neutral frame · ear tops
+        </button>
+      </div>
+      {activeTab === "lineRender" ? <Ava256LineRenderView /> : <Ava256EarTops />}
+    </div>
+  );
+}
+
+function Ava256LineRenderView() {
   const { selectedCapture, frames, isDone, isFramesLoading, isSaving, isFinishing, applyRanges, finish, dataset } =
     useAva256Store((state) => ({
       selectedCapture: state.selectedCapture,

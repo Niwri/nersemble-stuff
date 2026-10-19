@@ -1,7 +1,8 @@
 """Ava-256 capture review endpoints: one keyline video per capture
 (wrap_script_ava256/render_capture_line_video.py), per-frame Valid / Invalid /
 Rerun labels in its CSV, and Done (export + archive). See
-services/ava256_labels.py."""
+services/ava256_labels.py. Plus the neutral-frame multiview with manual ear
+tops (services/ava256_neutral.py)."""
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
@@ -13,8 +14,13 @@ from ...schemas.ava256 import (
     Ava256FrameRow,
     Ava256FramesResponse,
     Ava256LabelRangesRequest,
+    Ava256NeutralResponse,
+    Ava256SaveEarPointRequest,
+    Ava256SaveEarPointResponse,
 )
-from ...services import ava256_labels
+from ...schemas.common import LandmarkFrame
+from ...services import ava256_labels, ava256_neutral
+from ...services.ava256_neutral import Ava256NeutralError
 from ...services.ava256_labels import Ava256Error
 
 router = APIRouter(prefix="/ava256", tags=["ava256"])
@@ -64,3 +70,36 @@ def done(capture_id: str) -> Ava256DoneResponse:
     except Ava256Error as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     return Ava256DoneResponse(capture_id=capture_id, **result)
+
+
+def _neutral_call(fn, *args):
+    try:
+        return fn(*args)
+    except Ava256NeutralError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/{capture_id}/neutral", response_model=Ava256NeutralResponse)
+def get_neutral(capture_id: str) -> Ava256NeutralResponse:
+    return Ava256NeutralResponse(**_neutral_call(ava256_neutral.neutral_info, capture_id))
+
+
+@router.get("/{capture_id}/neutral/image/{camera_id}")
+def get_neutral_image(capture_id: str, camera_id: str) -> FileResponse:
+    path = _neutral_call(ava256_neutral.neutral_image_path, capture_id, camera_id)
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-cache"})
+
+
+@router.get("/{capture_id}/neutral/landmarks/{camera_id}", response_model=LandmarkFrame)
+def get_neutral_landmarks(capture_id: str, camera_id: str) -> LandmarkFrame:
+    return LandmarkFrame(**_neutral_call(ava256_neutral.neutral_landmarks, capture_id, camera_id))
+
+
+@router.post("/{capture_id}/neutral/ear", response_model=Ava256SaveEarPointResponse)
+def save_neutral_ear(capture_id: str, request: Ava256SaveEarPointRequest) -> Ava256SaveEarPointResponse:
+    result = _neutral_call(ava256_neutral.save_ear_point, capture_id, request.ear, dict(request.clicks))
+    return Ava256SaveEarPointResponse(**result)

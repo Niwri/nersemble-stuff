@@ -329,6 +329,7 @@ video{width:100%;max-height:68vh;background:#000}.card{border:1px solid var(--li
 <script>
 const NS=["no_neutral_label","unlabeled","unreviewed","unconfirmed","confirmed"];
 const NAME={no_neutral_label:"Unlabeled Neutral",unlabeled:"Labeled Neutral",unreviewed:"Propagated & Unwrapped",unconfirmed:"Wrapped & Unconfirmed",confirmed:"Wrapped & Confirmed"};
+const FAST_ACTOR_MIN=102,FAST_RATE=2.0;
 const LABELS=["Valid","Invalid","Rerun"],SKIN_FLAG=4.0;
 let S={ds:"N",state:null,on:new Set(NS),sel:null,tab:"overlay",ava:null,rw:"all"};
 const $=id=>document.getElementById(id),esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
@@ -367,9 +368,11 @@ async function transition(x,action){try{await api("/api/nersemble/transition",{a
 function showPair(x){const M=$("main"),hasVid=x.label_status==="unconfirmed"||x.label_status==="confirmed";
  M.innerHTML=`<h2>${esc(x.actor_id)} / ${esc(x.sequence_id)} <span class="pill s-${x.label_status}">${NAME[x.label_status]}</span></h2>`+
  (hasVid?`<div class="tabs"><button id="tO" class="${S.tab==="overlay"?"on":""}">Overlay Video</button><button id="tP" class="${S.tab==="points"?"on":""}">Overlay Landmarks</button></div>
- <div class="card"><video controls src="/video/nersemble/${encodeURIComponent(x.actor_id)}/${encodeURIComponent(x.sequence_id)}.${S.tab==="overlay"?"overlay":"points"}"></video></div>`
+ <div class="card"><video id="nv" controls src="/video/nersemble/${encodeURIComponent(x.actor_id)}/${encodeURIComponent(x.sequence_id)}.${S.tab==="overlay"?"overlay":"points"}"></video></div>`
  :`<p class="mute">Overlay videos are shown once a pair is wrapped (Wrapped & Unconfirmed / Confirmed).</p>`);
- if(hasVid){$("tO").onclick=()=>{S.tab="overlay";showPair(x)};$("tP").onclick=()=>{S.tab="points";showPair(x)}}}
+ if(hasVid){$("tO").onclick=()=>{S.tab="overlay";showPair(x)};$("tP").onclick=()=>{S.tab="points";showPair(x)};
+  // Nersemble overlay videos of actors FAST_ACTOR_MIN+ default to FAST_RATE (the player's speed menu still overrides).
+  const v=$("nv"),rate=parseInt(x.actor_id,10)>=FAST_ACTOR_MIN?FAST_RATE:1;v.defaultPlaybackRate=rate;v.playbackRate=rate}}
 // ---------------- Ava-256 (port of Ava256Player.tsx) ----------------
 function parseRanges(text,n){const ranges=[],errors=[];for(const raw of text.split(",")){const t=raw.trim();if(!t)continue;
  const m=t.match(/^(\d+)\s*(?:-\s*(\d+))?$/);if(!m){errors.push(`"${t}" isn't a frame or range`);continue}

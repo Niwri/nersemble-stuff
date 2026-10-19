@@ -216,3 +216,29 @@ export interface Ava256DoneResponse {
   labels_path: string;
   counts: Record<string, number>;
 }
+
+// Neutral frame · ear tops (backend services/ava256_neutral.py).
+export interface Ava256NeutralCamera {
+  camera_id: string;
+  side: "left" | "front" | "right" | "unknown";
+  azimuth_deg: number; // < 0: the actor's left
+  elevation_deg: number;
+  angle_deg: number;
+}
+
+export interface Ava256NeutralResponse {
+  capture_id: string;
+  frame_id: string;
+  coverage: number;
+  needed_total: number;
+  cameras: Ava256NeutralCamera[]; // cameras behind the head left out; sorted left -> right
+  default_cameras: string[];
+  ear_tops: number[]; // saved ear-top indices (2 = left, 9 = right)
+}
+
+export interface Ava256SaveEarPointResponse {
+  status: "ok";
+  world_xyz: [number, number, number];
+  cameras_used: string[];
+  reprojection_error_px: Record<string, number>;
+}

@@ -2,7 +2,9 @@ import type {
   Ava256DatasetResponse,
   Ava256DoneResponse,
   Ava256FramesResponse,
+  Ava256NeutralResponse,
   Ava256RangesByLabel,
+  Ava256SaveEarPointResponse,
   DatasetResponse,
   FaceScapeDatasetResponse,
   LabelStatusMapResponse,
@@ -216,6 +218,38 @@ export async function finishAva256Capture(captureId: string): Promise<Ava256Done
   }
 }
 
+export async function getAva256Neutral(captureId: string): Promise<Ava256NeutralResponse> {
+  // The first call for a capture may compute + cache its neutral frame.
+  return fetchJSON<Ava256NeutralResponse>(`${API_BASE}/ava256/${encodeURIComponent(captureId)}/neutral`);
+}
+
+export function getAva256NeutralImageUrl(captureId: string, cameraId: string): string {
+  return `${API_BASE}/ava256/${encodeURIComponent(captureId)}/neutral/image/${encodeURIComponent(cameraId)}`;
+}
+
+export async function getAva256NeutralLandmarks(captureId: string, cameraId: string): Promise<LandmarkFrame> {
+  return fetchJSON<LandmarkFrame>(
+    `${API_BASE}/ava256/${encodeURIComponent(captureId)}/neutral/landmarks/${encodeURIComponent(cameraId)}`
+  );
+}
+
+// Triangulate-only on the capture's neutral frame (ear_tops.json).
+export async function saveAva256EarPoint(
+  captureId: string,
+  ear: "left" | "right",
+  clicks: Record<string, { x: number; y: number }>
+): Promise<Ava256SaveEarPointResponse> {
+  const clicksPayload: Record<string, [number, number]> = {};
+  for (const [cameraId, { x, y }] of Object.entries(clicks)) {
+    clicksPayload[cameraId] = [x, y];
+  }
+  return fetchJSON<Ava256SaveEarPointResponse>(`${API_BASE}/ava256/${encodeURIComponent(captureId)}/neutral/ear`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ear, clicks: clicksPayload })
+  });
+}
+
 export async function getFaceScapeDataset(): Promise<FaceScapeDatasetResponse> {
   return fetchJSON<FaceScapeDatasetResponse>(`${API_BASE}/facescape/dataset`);
 }
@@ -313,6 +347,10 @@ export const api = {
   getAva256Frames,
   labelAva256Frames,
   finishAva256Capture,
+  getAva256Neutral,
+  getAva256NeutralImageUrl,
+  getAva256NeutralLandmarks,
+  saveAva256EarPoint,
   getFaceScapeImageUrl,
   getFaceScapeLandmarks,
   getFaceScapeSkinLandmarks,
